@@ -383,7 +383,7 @@ def process_workbook(file_bytes):
 
     firm_sheet = find_sheet_name(
         sheet_names,
-        "Firm Plan"
+        "firm"
     )
 
     bin_sheet = find_sheet_name(
@@ -956,6 +956,70 @@ def create_report(
 # PRODUCTION ALLOCATION
 # ============================================================
 
+# ============================================================
+# APPLY EDITED FIRM PLAN TO DETAIL
+# ============================================================
+
+def apply_edited_firm_plan_to_detail(original_firm_plan, edited_report):
+    """
+    Push the edited, description-level Firm Plan values from the
+    Matching & Requirement Preview table back to the detailed Firm Plan.
+
+    The original PO / Prod. Order structure is preserved. For each
+    Description, Expected Quantity is scaled proportionally so the
+    detailed rows add up to the edited Firm Plan total.
+    """
+
+    detail = original_firm_plan.copy()
+
+    if detail.empty:
+        return detail
+
+    detail["_Description Exact"] = (
+        detail["Description"].astype(str).str.strip()
+    )
+
+    edited = edited_report.copy()
+    edited["Description"] = (
+        edited["Description"].astype(str).str.strip()
+    )
+    edited["Firm Plan"] = pd.to_numeric(
+        edited["Firm Plan"], errors="coerce"
+    ).fillna(0.0)
+
+    edited_totals = dict(
+        zip(edited["Description"], edited["Firm Plan"])
+    )
+
+    detail["Expected Quantity"] = pd.to_numeric(
+        detail["Expected Quantity"], errors="coerce"
+    ).fillna(0.0)
+
+    for description, new_total in edited_totals.items():
+        mask = detail["_Description Exact"] == description
+
+        if not mask.any():
+            continue
+
+        old_total = float(detail.loc[mask, "Expected Quantity"].sum())
+
+        if old_total > 0:
+            detail.loc[mask, "Expected Quantity"] = (
+                detail.loc[mask, "Expected Quantity"]
+                * (float(new_total) / old_total)
+            )
+        else:
+            # If the original total is zero, put the edited total on
+            # the first row and keep the remaining rows at zero.
+            detail.loc[mask, "Expected Quantity"] = 0.0
+            first_index = detail.index[mask][0]
+            detail.at[first_index, "Expected Quantity"] = float(new_total)
+
+    detail.drop(columns=["_Description Exact"], inplace=True, errors="ignore")
+
+    return detail
+
+
 def allocate_production(
     firm_plan,
     bin_data,
@@ -1264,7 +1328,7 @@ def create_output_workbook(
     # Update the original Firm Plan sheet as soon as the workbook is processed.
     firm_sheet_name = find_sheet_name(
         wb.sheetnames,
-        "Firm Plan"
+        "firm"
     )
 
     if firm_sheet_name:
@@ -1540,8 +1604,6 @@ if uploaded_file:
         st.session_state.calculated = False
 
         st.session_state.yarn_search = ""
-        st.session_state.selected_yarn_description = None
-        st.session_state.sidebar_yarn_search = ""
 
         with st.spinner(
             "Reading workbook..."
@@ -1611,561 +1673,47 @@ if uploaded_file:
     )
 
     # ========================================================
-    # STEP 1
+    # STEP 1 — AUTOMATIC YARN MATCHING
     # ========================================================
 
-    st.subheader(
-        "1️⃣ Yarn Matching"
-    )
-
-    st.info(
-        "Use the sidebar to search/select a yarn, then select the required "
-        "STORES/WIP lots and Pending POs, then "
-        "save the matching."
-    )
-
-    # ========================================================
-    # SIDEBAR YARN LIST
-    # ========================================================
-
-    # The sidebar is now the only yarn search/navigation control.
-    descriptions_with_index = list(
-        enumerate(all_descriptions)
-    )
-
-    # ========================================================
-    # MATCHING UI — SIDEBAR YARN NAVIGATION
-    # ========================================================
-
-    if "selected_yarn_description" not in st.session_state:
-        st.session_state.selected_yarn_description = (
-            all_descriptions[0]
-            if all_descriptions
-            else None
-        )
-
-    # Keep the selected yarn valid after searching.
-    visible_descriptions = [
-        description
-        for _, description in descriptions_with_index
-    ]
-
-    if (
-        st.session_state.selected_yarn_description
-        not in visible_descriptions
-    ):
-        st.session_state.selected_yarn_description = (
-            visible_descriptions[0]
-            if visible_descriptions
-            else None
-        )
-
-    # --------------------------------------------------------
-    # SIDEBAR
-    # --------------------------------------------------------
-
-    with st.sidebar:
-        st.header("🧶 Yarn Matching")
-
-        st.caption(
-            f"{len(all_descriptions)} yarn description(s)"
-        )
-
-        sidebar_search = st.text_input(
-            "🔎 Search Yarn",
-            key="sidebar_yarn_search",
-            placeholder="Search description..."
-        )
-
-        sidebar_search_text = (
-            sidebar_search.strip().lower()
-        )
-
-        if sidebar_search_text:
-            sidebar_descriptions = [
-                description
-                for description in all_descriptions
-                if sidebar_search_text in str(description).lower()
-            ]
-        else:
-            sidebar_descriptions = all_descriptions
-
-        st.caption(
-            f"Showing {len(sidebar_descriptions)} yarn(s)"
-        )
-
-        # Use buttons instead of rendering every yarn's matching
-        # controls. Only the selected yarn's controls appear below.
-        for description in sidebar_descriptions:
-
-            saved = st.session_state.match_selections.get(
-                description,
-                {}
-            )
-
-            is_saved = bool(
-                saved.get("_saved", False)
-            )
-
-            prefix = "✅ " if is_saved else "⚪ "
-
-            if st.button(
-                prefix + str(description),
-                key=f"yarn_select_{all_descriptions.index(description)}",
-                use_container_width=True,
-                type=(
-                    "primary"
-                    if description
-                    == st.session_state.selected_yarn_description
-                    else "secondary"
-                )
-            ):
-                st.session_state.selected_yarn_description = description
-                st.rerun()
-
-    # --------------------------------------------------------
-    # CURRENT YARN MATCHING
-    # --------------------------------------------------------
-
-    selected_description = (
-        st.session_state.selected_yarn_description
-    )
-
-    if selected_description:
-
-        automatic_key = normalize_yarn_description(
-            selected_description
-        )
-
-        stores_options = bin_lookup.get(
-            (automatic_key, "STORES"),
-            []
-        )
-
-        wip_options = bin_lookup.get(
-            (automatic_key, "WIP"),
-            []
-        )
-
-        pending_options = pending_lookup.get(
-            automatic_key,
-            []
-        )
-
-        saved = st.session_state.match_selections.get(
-            selected_description,
-            {}
-        )
-
-        saved_stores = saved.get(
-            "stores_lots",
-            []
-        )
-
-        saved_wip = saved.get(
-            "wip_lots",
-            []
-        )
-
-        saved_pending = saved.get(
-            "pending_lots",
-            []
-        )
-
-        st.markdown(
-            f"### 🧶 {selected_description}"
-        )
-
-        st.caption(
-            "Automatic matching key: "
-            + automatic_key
-        )
-
-        # ----------------------------------------------------
-        # CURRENT YARN MATCHING FORM
-        # ----------------------------------------------------
-        # All checkboxes are inside this form. Therefore clicking a
-        # checkbox does NOT rerun the full Streamlit program.
-        # The app reruns only when Save Matching is clicked.
-        with st.form(
-            f"matching_form_{all_descriptions.index(selected_description)}"
-        ):
-
-            # ------------------------------------------------
-            # STORES
-            # ------------------------------------------------
-
-            st.markdown("#### 📦 STORES")
-
-            current_stores = []
-
-            if not stores_options:
-                st.caption("No matching STORES lots.")
-            else:
-                for option_number, option in enumerate(stores_options):
-
-                    lot = option["lot"]
-
-                    selected = st.checkbox(
-                        option["description"]
-                        + " | Lot: "
-                        + lot
-                        + " | Qty: "
-                        + f"{option['quantity']:,.2f}",
-                        value=(
-                            lot in saved_stores
-                            or (
-                                len(stores_options) == 1
-                                and not saved.get("_saved", False)
-                            )
-                        ),
-                        key=(
-                            f"current_stores_"
-                            f"{all_descriptions.index(selected_description)}_"
-                            f"{option_number}"
-                        )
-                    )
-
-                    if selected:
-                        current_stores.append(lot)
-
-                if current_stores:
-                    stores_total = sum(
-                        option["quantity"]
-                        for option in stores_options
-                        if option["lot"] in current_stores
-                    )
-
-                    st.caption(
-                        f"Selected {len(current_stores)} lot(s) | "
-                        f"Total: {stores_total:,.2f}"
-                    )
-
-            # ------------------------------------------------
-            # WIP
-            # ------------------------------------------------
-
-            st.markdown("#### 🏭 WIP")
-
-            current_wip = []
-
-            if not wip_options:
-                st.caption("No matching WIP lots.")
-            else:
-                for option_number, option in enumerate(wip_options):
-
-                    lot = option["lot"]
-
-                    selected = st.checkbox(
-                        option["description"]
-                        + " | Lot: "
-                        + lot
-                        + " | Qty: "
-                        + f"{option['quantity']:,.2f}",
-                        value=(
-                            lot in saved_wip
-                            or (
-                                len(wip_options) == 1
-                                and not saved.get("_saved", False)
-                            )
-                        ),
-                        key=(
-                            f"current_wip_"
-                            f"{all_descriptions.index(selected_description)}_"
-                            f"{option_number}"
-                        )
-                    )
-
-                    if selected:
-                        current_wip.append(lot)
-
-                if current_wip:
-                    wip_total = sum(
-                        option["quantity"]
-                        for option in wip_options
-                        if option["lot"] in current_wip
-                    )
-
-                    st.caption(
-                        f"Selected {len(current_wip)} lot(s) | "
-                        f"Total: {wip_total:,.2f}"
-                    )
-
-            # ------------------------------------------------
-            # PENDING PO
-            # ------------------------------------------------
-
-            st.markdown("#### 📋 Pending PO")
-
-            current_pending = []
-
-            if not pending_options:
-                st.caption("No matching Pending PO.")
-            else:
-                for option_number, option in enumerate(pending_options):
-
-                    lot = option["lot"]
-
-                    selected = st.checkbox(
-                        option["description"]
-                        + " | Document/Lot: "
-                        + lot
-                        + " | Qty: "
-                        + f"{option['quantity']:,.2f}",
-                        value=(
-                            lot in saved_pending
-                            or (
-                                len(pending_options) == 1
-                                and not saved.get("_saved", False)
-                            )
-                        ),
-                        key=(
-                            f"current_pending_"
-                            f"{all_descriptions.index(selected_description)}_"
-                            f"{option_number}"
-                        )
-                    )
-
-                    if selected:
-                        current_pending.append(lot)
-
-                if current_pending:
-                    pending_total = sum(
-                        option["quantity"]
-                        for option in pending_options
-                        if option["lot"] in current_pending
-                    )
-
-                    st.caption(
-                        f"Selected {len(current_pending)} Pending PO(s) | "
-                        f"Total: {pending_total:,.2f}"
-                    )
-
-            st.divider()
-
-            save_current = st.form_submit_button(
-                "💾 Save Matching",
-                type="primary",
-                use_container_width=True
-            )
-
-        # ------------------------------------------------
-        # SAVE CURRENT YARN
-        # ------------------------------------------------
-
-        if save_current:
-
-            st.session_state.match_selections[
-                selected_description
-            ] = {
-                "stores_lots": current_stores,
-                "wip_lots": current_wip,
-                "pending_lots": current_pending,
-                "_saved": True
-            }
-
-            st.success(
-                f"✅ Matching saved for: "
-                f"{selected_description}"
-            )
-
-            st.rerun()
-
-    else:
-        st.info(
-            "Select a yarn description from the sidebar "
-            "to start matching."
-        )
-
-    # ========================================================
-    # MATCHING SUMMARY
-    # ========================================================
-
-    st.markdown(
-        "### Matching Summary"
-    )
-
-    summary_rows = []
+    st.subheader("1️⃣ Automatic Yarn Matching")
+    st.info("All matching STORES lots, WIP lots and Pending PO lots are automatically selected, irrespective of lot number.")
+
+    automatic_selections = {}
+    matching_summary_rows = []
 
     for description in all_descriptions:
+        automatic_key = normalize_yarn_description(description)
+        stores_options = bin_lookup.get((automatic_key, "STORES"), [])
+        wip_options = bin_lookup.get((automatic_key, "WIP"), [])
+        pending_options = pending_lookup.get(automatic_key, [])
 
-        selection = (
-            st.session_state
-            .match_selections
-            .get(
-                description,
-                {}
-            )
-        )
+        automatic_selections[description] = {
+            "stores_lots": [o["lot"] for o in stores_options],
+            "wip_lots": [o["lot"] for o in wip_options],
+            "pending_lots": [o["lot"] for o in pending_options],
+            "_saved": True
+        }
 
-        stores_lots = selection.get(
-            "stores_lots",
-            []
-        )
+        matching_summary_rows.append({
+            "Description": description,
+            "STORES": " | ".join(f"{o['lot']} ({o['quantity']:,.2f})" for o in stores_options) or "No match",
+            "WIP": " | ".join(f"{o['lot']} ({o['quantity']:,.2f})" for o in wip_options) or "No match",
+            "Pending PO": " | ".join(f"{o['lot']} ({o['quantity']:,.2f})" for o in pending_options) or "No match"
+        })
 
-        wip_lots = selection.get(
-            "wip_lots",
-            []
-        )
+    st.session_state.match_selections = automatic_selections
+    st.dataframe(pd.DataFrame(matching_summary_rows), use_container_width=True, hide_index=True)
 
-        pending_lots = selection.get(
-            "pending_lots",
-            []
-        )
-
-        # STORES
-
-        stores_options = bin_lookup.get(
-            (
-                normalize_yarn_description(
-                    description
-                ),
-                "STORES"
-            ),
-            []
-        )
-
-        stores_values = []
-
-        for option in stores_options:
-
-            if option["lot"] in stores_lots:
-
-                stores_values.append(
-                    f"{option['lot']} "
-                    f"({option['quantity']:,.2f})"
-                )
-
-        stores_text = (
-            " | ".join(stores_values)
-            if stores_values
-            else "No match"
-        )
-
-        # WIP
-
-        wip_options = bin_lookup.get(
-            (
-                normalize_yarn_description(
-                    description
-                ),
-                "WIP"
-            ),
-            []
-        )
-
-        wip_values = []
-
-        for option in wip_options:
-
-            if option["lot"] in wip_lots:
-
-                wip_values.append(
-                    f"{option['lot']} "
-                    f"({option['quantity']:,.2f})"
-                )
-
-        wip_text = (
-            " | ".join(wip_values)
-            if wip_values
-            else "No match"
-        )
-
-        # PENDING
-
-        pending_options = pending_lookup.get(
-            normalize_yarn_description(
-                description
-            ),
-            []
-        )
-
-        pending_values = []
-
-        for option in pending_options:
-
-            if option["lot"] in pending_lots:
-
-                pending_values.append(
-                    f"{option['lot']} "
-                    f"({option['quantity']:,.2f})"
-                )
-
-        pending_text = (
-            " | ".join(pending_values)
-            if pending_values
-            else "No match"
-        )
-
-        summary_rows.append(
-            {
-                "Firm Plan":
-                    description,
-
-                "STORES":
-                    stores_text,
-
-                "WIP":
-                    wip_text,
-
-                "Pending PO":
-                    pending_text
-            }
-        )
-
-    st.dataframe(
-        pd.DataFrame(
-            summary_rows
-        ),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # CONFIRM MATCHING
-    # ========================================================
-
-    if st.button(
-        "✅ Confirm Yarn Matching",
-        type="primary",
-        use_container_width=True
-    ):
-
-        (
-            matched_firm,
-            matched_bin,
-            matched_pending
-        ) = apply_matching(
-            firm_plan,
-            bin_data,
-            pending_po,
-            st.session_state.match_selections
-        )
-
-        st.session_state.firm_plan = (
-            matched_firm
-        )
-
-        st.session_state.bin_data = (
-            matched_bin
-        )
-
-        st.session_state.pending_po = (
-            matched_pending
-        )
-
+    if st.button("✅ Confirm Yarn Matching", type="primary", use_container_width=True):
+        matched_firm, matched_bin, matched_pending = apply_matching(firm_plan, bin_data, pending_po, automatic_selections)
+        st.session_state.firm_plan = matched_firm
+        st.session_state.bin_data = matched_bin
+        st.session_state.pending_po = matched_pending
         st.session_state.matching_confirmed = True
-
         st.session_state.report_df = None
-
         st.session_state.pending_firm_plan = None
-
         st.session_state.calculated = False
-
-        st.success(
-            "Yarn matching confirmed."
-        )
-
         st.rerun()
 
     # ========================================================
@@ -2182,133 +1730,65 @@ if uploaded_file:
         st.stop()
 
     # ========================================================
-    # STEP 2 — REQUIREMENT PREVIEW
+    # STEP 2 — MATCHING + REQUIREMENT PREVIEW
     # ========================================================
 
-    st.subheader(
-        "2️⃣ Requirement Preview"
-    )
+    st.subheader("2️⃣ Matching & Requirement Preview")
 
-    firm_plan = (
-        st.session_state.firm_plan
-    )
-
-    bin_data = (
-        st.session_state.bin_data
-    )
-
-    pending_po = (
-        st.session_state.pending_po
-    )
+    firm_plan = st.session_state.firm_plan
+    bin_data = st.session_state.bin_data
+    pending_po = st.session_state.pending_po
 
     if st.session_state.report_df is None:
+        report_df = create_report(firm_plan, bin_data, pending_po)
+        report_df, pending_firm_plan = allocate_production(firm_plan, bin_data, pending_po, report_df)
+        st.session_state.report_df = report_df
+        st.session_state.pending_firm_plan = pending_firm_plan
 
-        report_df = create_report(
-            firm_plan,
-            bin_data,
-            pending_po
-        )
+    report_df = st.session_state.report_df.copy()
+    merged_rows = []
 
-        (
-            report_df,
-            pending_firm_plan
-        ) = allocate_production(
-            firm_plan,
-            bin_data,
-            pending_po,
-            report_df
-        )
+    for _, row in report_df.iterrows():
+        description = str(row.get("Description", "")).strip()
+        automatic_key = normalize_yarn_description(description)
+        stores_options = bin_lookup.get((automatic_key, "STORES"), [])
+        wip_options = bin_lookup.get((automatic_key, "WIP"), [])
+        pending_options = pending_lookup.get(automatic_key, [])
 
-        st.session_state.report_df = (
-            report_df
-        )
+        merged_rows.append({
+            "Description": description,
+            "STORES": " | ".join(f"{o['lot']} ({o['quantity']:,.2f})" for o in stores_options) or "No match",
+            "WIP Lots": " | ".join(f"{o['lot']} ({o['quantity']:,.2f})" for o in wip_options) or "No match",
+            "Pending PO": " | ".join(f"{o['lot']} ({o['quantity']:,.2f})" for o in pending_options) or "No match",
+            "Firm Plan": safe_float(row.get("Firm Plan")),
+            "Wastage 20%": safe_float(row.get("Wastage 20%")),
+            "Requirement": safe_float(row.get("Requirement")),
+            "Safety Stock": safe_float(row.get("Safety Stock")),
+            "Stores": safe_float(row.get("Stores")),
+            "WIP": safe_float(row.get("WIP")),
+            "Purchase Qty": safe_float(row.get("Purchase Qty")),
+            "Manual Purchase Qty": safe_float(row.get("Manual Purchase Qty"))
+        })
 
-        st.session_state.pending_firm_plan = (
-            pending_firm_plan
-        )
+    merged_df = pd.DataFrame(merged_rows)
 
-    report_df = (
-        st.session_state.report_df.copy()
-    )
-
-    preview_columns = [
-        "Description",
-        "Firm Plan",
-        "Wastage 20%",
-        "Requirement",
-        "Safety Stock",
-        "Stores",
-        "WIP",
-        "Purchase Qty",
-        "Manual Purchase Qty"
-    ]
-
-    with st.form("requirement_form"):
+    with st.form("merged_requirement_form"):
         edited_preview = st.data_editor(
-            report_df[
-                preview_columns
-            ].copy(),
-            use_container_width=True,
-            hide_index=True,
-
-            disabled=[
-                "Description",
-                "Firm Plan",
-                "Wastage 20%",
-                "Requirement"
-            ],
-
+            merged_df, use_container_width=True, hide_index=True,
+            disabled=["Description", "STORES", "WIP Lots", "Pending PO", "Wastage 20%", "Requirement", "Stores"],
             column_config={
-
-                "Firm Plan":
-                    st.column_config.NumberColumn(
-                        format="%.2f"
-                    ),
-
-                "Wastage 20%":
-                    st.column_config.NumberColumn(
-                        format="%.2f"
-                    ),
-
-                "Requirement":
-                    st.column_config.NumberColumn(
-                        format="%.2f"
-                    ),
-
-                "Safety Stock":
-                    st.column_config.NumberColumn(
-                        format="%.2f"
-                    ),
-
-                "Stores":
-                    st.column_config.NumberColumn(
-                        format="%.2f"
-                    ),
-
-                "WIP":
-                    st.column_config.NumberColumn(
-                        format="%.2f"
-                    ),
-
-                "Purchase Qty":
-                    st.column_config.NumberColumn(
-                        format="%.2f"
-                    ),
-
-                "Manual Purchase Qty":
-                    st.column_config.NumberColumn(
-                        format="%.2f"
-                    )
+                "Firm Plan": st.column_config.NumberColumn(format="%.2f"),
+                "Wastage 20%": st.column_config.NumberColumn(format="%.2f"),
+                "Requirement": st.column_config.NumberColumn(format="%.2f"),
+                "Safety Stock": st.column_config.NumberColumn(format="%.2f"),
+                "Stores": st.column_config.NumberColumn(format="%.2f"),
+                "WIP": st.column_config.NumberColumn(format="%.2f"),
+                "Purchase Qty": st.column_config.NumberColumn(format="%.2f"),
+                "Manual Purchase Qty": st.column_config.NumberColumn(format="%.2f")
             },
-
-            key="requirement_editor"
+            key="merged_requirement_editor"
         )
-
-        calculate_clicked = st.form_submit_button(
-            "🔄 Calculate",
-            type="primary",
-            use_container_width=True
-        )
+        calculate_clicked = st.form_submit_button("🔄 Calculate", type="primary", use_container_width=True)
 
     # ========================================================
     # CALCULATE
@@ -2322,44 +1802,31 @@ if uploaded_file:
             .copy()
         )
 
-        working["Stores"] = pd.to_numeric(
-            edited_preview["Stores"],
-            errors="coerce"
-        ).fillna(0)
+        # Apply all editable values from the combined table.
+        working["Firm Plan"] = pd.to_numeric(edited_preview["Firm Plan"], errors="coerce").fillna(0)
+        working["Safety Stock"] = pd.to_numeric(edited_preview["Safety Stock"], errors="coerce").fillna(0)
+        working["WIP"] = pd.to_numeric(edited_preview["WIP"], errors="coerce").fillna(0)
+        working["Manual Purchase Qty"] = pd.to_numeric(edited_preview["Manual Purchase Qty"], errors="coerce").fillna(0)
+        working["Purchase Qty"] = pd.to_numeric(edited_preview["Purchase Qty"], errors="coerce").fillna(0)
 
-        working["WIP"] = pd.to_numeric(
-            edited_preview["WIP"],
-            errors="coerce"
-        ).fillna(0)
+        # Recalculate requirement values using the edited Firm Plan.
+        working["Wastage 20%"] = working["Firm Plan"] * 0.20
+        working["Requirement"] = working["Firm Plan"] + working["Wastage 20%"]
+        working["Gross Requirement"] = working["Requirement"] + working["Safety Stock"]
+        working["Total Stock"] = working["Stores"] + working["WIP"]
+        working["Diff"] = working["Gross Requirement"] - working["Total Stock"]
+        working["Requirement PO"] = working["Diff"] - working["Purchase Qty"]
 
-        working["Safety Stock"] = pd.to_numeric(
-            edited_preview["Safety Stock"],
-            errors="coerce"
-        ).fillna(0)
-
-        working[
-            "Manual Purchase Qty"
-        ] = pd.to_numeric(
-            edited_preview[
-                "Manual Purchase Qty"
-            ],
-            errors="coerce"
-        ).fillna(0)
-
-        # Recalculate Total Stock before production allocation so
-        # edited STORES / WIP / Safety Stock values are used.
-        working["Total Stock"] = (
-            working["Stores"]
-            + working["WIP"]
+        # Re-run production allocation using the EDITED Firm Plan.
+        edited_firm_plan = apply_edited_firm_plan_to_detail(
+            st.session_state.firm_plan,
+            working
         )
-
-        # Re-run production allocation using the ORIGINAL Firm Plan
-        # and the edited report as the stock source.
         (
             working,
             pending_firm_plan
         ) = allocate_production(
-            st.session_state.firm_plan,
+            edited_firm_plan,
             st.session_state.bin_data,
             st.session_state.pending_po,
             working
